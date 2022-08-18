@@ -2,6 +2,11 @@ require('dotenv').config();
 const express = require('express');
 const cros = require('cors');
 const AWS = require("aws-sdk");
+const fs = require('fs');
+const path = require('path');
+const Memcached = require('memcached');
+
+const memcached = new Memcached("localhost:11211");
 
 AWS.config.update({
     endpoint: process.env.ENDPOINT,
@@ -13,9 +18,67 @@ AWS.config.update({
 const app = express();
 app.use(cros());
 
+app.get("/get-bucket", (req, res, next) => {
+    const s3 = new AWS.S3();
+    s3.listBuckets((err, data) => {
+        if (err) next(err);
+        res.status(200).json(data);
+    })
+});
+
+app.get("/get-location", (req, res, next) => {
+    const bucket = req.query["name"];
+    const s3 = new AWS.S3();
+    s3.getBucketLocation({ Bucket: bucket }, (err, data) => {
+        if (err) next(err);
+        res.status(200).json(data);
+    })
+});
+
+app.get("/delete-bucket", (req, res, next) => {
+    const s3 = new AWS.S3();
+    s3.listBuckets((err, data) => {
+        if (err) next(err);
+        if (data.Buckets.find(bucket => bucket.Name === "test-upfile")) {
+            s3.deleteBucket({ Bucket: "test-upfile" }, function (err, data) {
+                if (err) next(err);
+                else res.status(201).json(data);
+            }
+            )
+        }
+        else {
+            next(new Error({ message: "Bucket already exists" }))
+        }
+    })
+})
+
+app.get("/set-bucket", (req, res, next) => {
+    const s3 = new AWS.S3();
+    const bucket = req.query["name"];
+    s3.listBuckets((err, data) => {
+        if (err) next(err);
+        if (!data.Buckets.find(bucket => bucket.Name === process.env.BUCKET)) {
+            const params = {
+                Bucket: "test-upfile",
+                CreateBucketConfiguration: {
+                    LocationConstraint: bucket
+                }
+            };
+            s3.createBucket(params, function (err, data) {
+                if (err) next(err);
+                else res.status(201).json(data);
+            }
+            )
+        }
+        else {
+            next(new Error({ message: "Bucket already exists" }))
+        }
+    })
+})
 
 app.get("/sign-s3", (req, res, next) => {
     const s3 = new AWS.S3();
+
     s3.putBucketCors(
         {
             Bucket: process.env.BUCKET,
@@ -72,7 +135,7 @@ app.get("/sign-s3", (req, res, next) => {
     const params = {
         Bucket: process.env.BUCKET,
         Key: fileName,
-        Expires: 300,
+        Expires: 180,
         ContentType: fileType,
         ACL: "public-read"
     };
@@ -144,7 +207,7 @@ app.get("/down-sign-s3", (req, res, next) => {
     });
 
     const fileName = req.query["file-name"];
-    const fileType = req.query["file-type"];
+    //const fileType = req.query["file-type"];
     const params = {
         Bucket: process.env.BUCKET,
         Key: fileName,
@@ -161,7 +224,68 @@ app.get("/down-sign-s3", (req, res, next) => {
             return res.status(200).json(data);
         }
     });
-})
+});
+
+app.get("/save-file", (req, res, next) => {
+    const s3 = new AWS.S3();
+    const fileName = req.query["file-name"];
+    memcached.get(fileName, (err, data) => {
+        if (data) {
+            console.log("Cached");
+            res.json({
+                type: "cache",
+                data: data
+            });
+        }
+        else if (err) {
+            next(err);
+        }
+        else {
+            const params = {
+                Bucket: process.env.BUCKET,
+                Key: fileName,
+            };
+            s3.getObject(params, function (err, data) {
+                if (err) next(err);
+                else {
+                    //const pathFile = path.join(__dirname, `./file/${fileName}`);
+                    memcached.set(fileName, data.Body, 600, (err) => {
+                        if (err) {
+                            next(err);
+                        }
+                    });
+                    //let writeStr = fs.createWriteStream(pathFile);
+                    //writeStr.write(data.Body);
+                    res.json({
+                        type: "no-cache",
+                        data: data.Body
+                    });
+                }
+            });
+        }
+    });
+});
+
+app.get("/delete-file", (req, res, next) => {
+    const s3 = new AWS.S3();
+    const fileName = req.query["file-name"];
+    const params = {
+        Bucket: process.env.BUCKET,
+        Key: fileName
+    };
+    s3.deleteObject(params, function (err, data) {
+        if (err) next(err);
+        else {
+            memcached.get(fileName, (err, data)=>{
+                if(err) return next(err);
+                memcached.del(fileName, (err)=>{
+                    if(err) return next(err);
+                });
+            });
+            res.json("Success");
+        }
+    });
+});
 
 app.use((err, req, res) => {
     const status = err.status || 500;
@@ -175,4 +299,4 @@ app.use((err, req, res) => {
 
 app.listen(5000, () => {
     console.log("Sever is listening...");
-})
+});
