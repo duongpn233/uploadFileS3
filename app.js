@@ -2,15 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const cros = require('cors');
 const AWS = require("aws-sdk");
-const fs = require('fs');
-const path = require('path');
 const Memcached = require('memcached');
 const { Buffer } = require('buffer');
 const { createClient } = require('redis');
 const bodyParser = require('body-parser');
 const uploadFile = require('./middleware/upFiles');
 const { uploadPart, createMultipart, completeUpload, abortUpload } = require('./util/uploadMultipart');
-
+const { getSizeFile, getPartFile } = require('./util/getFileMultipart');
 
 const memcached = new Memcached("localhost:11211");
 
@@ -249,9 +247,11 @@ app.get("/save-file", async (req, res, next) => {
         const s3 = new AWS.S3();
         const fileName = req.query["file-name"];
         let metadata = await client.hGetAll(fileName);
+        let checkCache = false;
         memcached.get(fileName, (err, data) => {
             if (data) {
                 const dataRes = Buffer.from(data, 'base64');
+                checkCache = true;
                 res.json({
                     type: "cache",
                     data: dataRes,
@@ -261,22 +261,32 @@ app.get("/save-file", async (req, res, next) => {
             else if (err) {
                 next(err);
             }
+        });
+
+        if (!checkCache) {
+            let sizeFile = 0;
+            if (metadata) {
+                sizeFile = metadata.size;
+            }
             else {
+                sizeFile = await getSizeFile(s3, fileName);
+                console.log(sizeFile);
+            }
+
+            if (sizeFile < 20971520) {
+                console.log("Get small file");
                 const params = {
                     Bucket: process.env.BUCKET,
-                    Key: fileName,
+                    Key: fileName
                 };
                 s3.getObject(params, function (err, data) {
                     if (err) next(err);
                     else {
-                        //const pathFile = path.join(__dirname, `./file/${fileName}`);
                         memcached.set(fileName, data.Body.toString('base64'), 600, (err) => {
                             if (err) {
                                 next(err);
                             }
                         });
-                        //let writeStr = fs.createWriteStream(pathFile);
-                        //writeStr.write(data.Body);
                         if (!metadata) {
                             metadata = {
                                 size: data.ContentLength,
@@ -295,7 +305,28 @@ app.get("/save-file", async (req, res, next) => {
                     }
                 });
             }
-        });
+            else {
+                console.log("Get big file");
+                const chunkSize = Math.pow(1024, 2) * 10;
+                const totalPart = Math.ceil(sizeFile / chunkSize);
+                const arrPart = Array.from(Array(totalPart).keys());
+                const arrBuffs = await Promise.all(
+                    arrPart.map((part) => {
+                        return getPartFile(s3, fileName, part * chunkSize, (part + 1) * chunkSize - 1, part + 1)
+                    })
+                );
+                const resBuffs = arrBuffs.reduce((buff, currentBuff) => {
+                    return buff.concat(currentBuff.data);
+                }, []);
+                const buffers = Buffer.concat(resBuffs);
+                console.log("buffers", buffers)
+                res.json({
+                    type: "no-cache",
+                    data: resBuffs,
+                    metadata: metadata
+                })
+            }
+        }
     } catch (error) {
         next(error);
     }
@@ -358,7 +389,7 @@ app.post("/up-file-s3", uploadFile.any(), async (req, res, next) => {
         let checkCache = false;
         for (let i = 0; i < req.files.length; i++) {
             console.log(req.files[i]);
-            if (req.files[i].size < 50971520) {
+            if (req.files[i].size < 20971520) {
                 console.log("Up small size")
                 const params = { Bucket: process.env.BUCKET, Key: req.files[i].originalname, Body: req.files[i].buffer };
                 s3.upload(params, function (err, data) {
@@ -378,7 +409,7 @@ app.post("/up-file-s3", uploadFile.any(), async (req, res, next) => {
                 console.log(uploadId)
                 const resParts = await Promise.allSettled(
                     arrPart.map((part) => {
-                        uploadPart(s3, req.files[i].buffer.slice(part * chunkSize, (part + 1) * chunkSize), uploadId, part + 1, req.files[i].originalname);
+                        return uploadPart(s3, req.files[i].buffer.slice(part * chunkSize, (part + 1) * chunkSize), uploadId, part + 1, req.files[i].originalname);
                     })
                 );
                 console.log(resParts);
@@ -396,7 +427,7 @@ app.post("/up-file-s3", uploadFile.any(), async (req, res, next) => {
                 if (failParts.length) {
                     const retriedParts = await Promise.all(
                         failParts.map((part) => {
-                            uploadPart(s3, req.files[i].buffer.slice((part - 1) * chunkSize, part * chunkSize), uploadId, part, req.files[i].originalname);
+                            return uploadPart(s3, req.files[i].buffer.slice((part - 1) * chunkSize, part * chunkSize), uploadId, part, req.files[i].originalname);
                         })
                     );
                     succeedParts.push(...retriedParts);
@@ -412,11 +443,11 @@ app.post("/up-file-s3", uploadFile.any(), async (req, res, next) => {
             }
 
             if (checkCache) {
-                memcached.set(req.files[i].originalname, req.files[i].buffer.toString('base64'), 600, (err) => {
-                    if (err) {
-                        next(err);
-                    }
-                });
+                // memcached.set(req.files[i].originalname, req.files[i].buffer.toString('base64'), 600, (err) => {
+                //     if (err) {
+                //         next(err);
+                //     }
+                // });
                 client.hSet(req.files[i].originalname, 'type', req.files[i].mimetype);
                 client.hSet(req.files[i].originalname, 'size', req.files[i].size);
                 client.hSet(req.files[i].originalname, 'encoding', req.files[i].encoding);
@@ -430,6 +461,7 @@ app.post("/up-file-s3", uploadFile.any(), async (req, res, next) => {
         next(error);
     }
 });
+
 
 app.get("/get-total-size-bucket", (req, res, next) => {
     const s3 = new AWS.S3();
