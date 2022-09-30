@@ -1,21 +1,20 @@
-const getSizeFile = (s3, fileName) => {
-    const params = {
-        Bucket: process.env.BUCKET,
-        Key: fileName
-    };
+const { connect } = require('../util/connectDb');
+
+const getSizeFile = (userId, fileName) => {
     return new Promise((resolve, reject) => {
-        s3.headObject(params, function (err, data) {
-            console.log("Get size...");
+        const sql = `SELECT * FROM metadatas where name='${fileName}' and userId=${userId}`;
+        connect.query(sql, (err, data) => {
             if (err) reject(err);
-            else resolve(data.ContentLength);
+            else resolve(data[0]);
         });
-    })
+    });
 };
 
-const getPartFile = (s3, fileName, start, end, partNumber) => {
+const getPartFile = (s3, verId ,fileName, start, end, partNumber) => {
     const params = {
         Bucket: process.env.BUCKET,
         Key: fileName,
+        VersionId: verId,
         Range: `bytes=${start}-${end}`
     };
     return new Promise((resolve, reject) => {
@@ -33,4 +32,4 @@ const getPartFile = (s3, fileName, start, end, partNumber) => {
     })
 }
 
-module.exports = { getSizeFile, getPartFile};
+module.exports = { getSizeFile, getPartFile };

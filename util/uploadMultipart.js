@@ -69,4 +69,14 @@ const completeUpload = (s3, uploadId, parts, fileName) => {
     });
 };
 
-module.exports = { uploadPart, createMultipart, completeUpload, abortUpload };
+const upload = (params, s3) => {
+    return new Promise((resolve, reject) => {
+        s3.upload(params, (err, data) => {
+            console.log(data);
+            if (err) reject(err);
+            else resolve(data);
+        });
+    });
+}
+
+module.exports = { uploadPart, createMultipart, completeUpload, abortUpload, upload };
